@@ -13,12 +13,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::spawn;
 use tokio::sync::broadcast;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 use zbus::export::ordered_stream::OrderedStreamExt;
 use zbus::fdo::{DBusProxy, PropertiesProxy};
 use zbus::names::InterfaceName;
 use zbus::zvariant::Value;
-use zbus::{Connection, ConnectionBuilder, Message};
+use zbus::{Connection, Message};
 
 /// An event emitted by the client
 /// representing a change from either the StatusNotifierItem
@@ -86,53 +86,41 @@ impl Client {
     /// If the initialization fails for any reason,
     /// for example if unable to connect to the bus,
     /// this method will return an error.
-    pub async fn new(service_name: &str) -> crate::error::Result<Self> {
+    pub async fn new() -> crate::error::Result<Self> {
+        let connection = Connection::session().await?;
         let (tx, rx) = broadcast::channel(32);
 
         // first start server...
-        let watcher = StatusNotifierWatcher::new();
-
-        let connection = ConnectionBuilder::session()?
-            .name("org.kde.StatusNotifierWatcher")?
-            .serve_at("/StatusNotifierWatcher", watcher)?
-            .build()
-            .await?;
+        StatusNotifierWatcher::new();
 
         // ...then connect to it
         let watcher_proxy = StatusNotifierWatcherProxy::new(&connection).await?;
 
         // register a host on the watcher to declare we want to watch items
-        let service_name = format!("StatusNotifierHost-{service_name}");
+        // get a well-known name
+        let pid = std::process::id();
+        let mut i = 0;
+        let wellknown = loop {
+            use zbus::fdo::RequestNameReply::*;
+
+            i += 1;
+            let wellknown = format!("org.freedesktop.StatusNotifierHost-{}-{}", pid, i);
+            let wellknown: zbus::names::WellKnownName = wellknown.try_into().expect("generated well-known name is invalid");
+
+            let flags = [zbus::fdo::RequestNameFlags::DoNotQueue];
+            match connection.request_name_with_flags(&wellknown, flags.into_iter().collect()).await? {
+                PrimaryOwner => break wellknown,
+                Exists => {}
+                AlreadyOwner => {}
+                InQueue => unreachable!("request_name_with_flags returned InQueue even though we specified DoNotQueue"),
+            };
+        };
+
         watcher_proxy
-            .register_status_notifier_host(&service_name)
+            .register_status_notifier_host(&*wellknown)
             .await?;
 
         let items = Arc::new(Mutex::new(HashMap::new()));
-
-        // handle new items
-        {
-            let connection = connection.clone();
-            let tx = tx.clone();
-            let items = items.clone();
-
-            let mut stream = watcher_proxy
-                .receive_status_notifier_item_registered()
-                .await?;
-
-            spawn(async move {
-                while let Some(item) = stream.next().await {
-                    let address = item.args().map(|args| args.service);
-
-                    if let Ok(address) = address {
-                        debug!("received new item: {address}");
-                        Self::handle_item(address, connection.clone(), tx.clone(), items.clone())
-                            .await?;
-                    }
-                }
-
-                Ok::<(), Error>(())
-            });
-        }
 
         // then lastly get all items
         // it can take so long to fetch all items that we have to do this last,
@@ -144,7 +132,7 @@ impl Client {
 
             spawn(async move {
                 let initial_items = watcher_proxy.registered_status_notifier_items().await?;
-                debug!("initial items: {initial_items:?}");
+                info!("initial items: {initial_items:?}");
 
                 for item in initial_items {
                     Self::handle_item(&item, connection.clone(), tx.clone(), items.clone()).await?;
@@ -154,7 +142,7 @@ impl Client {
             });
         }
 
-        debug!("tray client initialized");
+        info!("tray client initialized");
 
         Ok(Self {
             connection,
@@ -205,7 +193,7 @@ impl Client {
                 Self::watch_item_properties(&destination, &path, &connection, properties_proxy, tx)
                     .await?;
 
-                debug!("Stopped watching {destination}{path}");
+                info!("Stopped watching {destination}{path}");
                 Ok::<(), Error>(())
             });
         }
@@ -270,7 +258,7 @@ impl Client {
             tokio::select! {
                 Some(change) = props_changed.next() => {
                     if let Some(event) = Self::get_update_event(change, &properties_proxy).await {
-                        debug!("[{destination}{path}] received property change: {event:?}");
+                        info!("[{destination}{path}] received property change: {event:?}");
                         tx.send(Event::Update(destination.to_string(), event))?;
                     }
                 }
@@ -281,7 +269,7 @@ impl Client {
 
                     if let (Some(old), None) = (old.as_ref(), new.as_ref()) {
                         if old == destination {
-                            debug!("[{destination}{path}] disconnected");
+                            info!("[{destination}{path}] disconnected");
 
                             let watcher_proxy = StatusNotifierWatcherProxy::new(connection)
                                 .await
@@ -316,7 +304,7 @@ impl Client {
             .await
             .ok()?;
 
-        debug!("received tray item update: {member} -> {property:?}");
+        info!("received tray item update: {member} -> {property:?}");
 
         use UpdateEvent::*;
         match member.as_str() {
@@ -377,7 +365,7 @@ impl Client {
         let mut props_changed = dbus_menu_proxy.receive_all_signals().await?;
 
         while let Some(change) = props_changed.next().await {
-            debug!("[{destination}{menu_path}] received menu change: {change:?}");
+            info!("[{destination}{menu_path}] received menu change: {change:?}");
 
             match change.member() {
                 Some(name) if name == "LayoutUpdated" => {
